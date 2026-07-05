@@ -189,6 +189,7 @@ class TestFetchQuestionDetails:
                 "data": {
                     "question": {
                         "questionFrontendId": "1",
+                        "title": "Two Sum",
                         "difficulty": "Easy",
                         "topicTags": [
                             {"name": "Array"},
@@ -203,6 +204,7 @@ class TestFetchQuestionDetails:
 
         assert result == {
             "frontend_id": "1",
+            "title": "Two Sum",
             "difficulty": "Easy",
             "tags": ["Array", "Hash Table"],
         }

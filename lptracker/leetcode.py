@@ -7,6 +7,7 @@ through the module-level ``_graphql`` helper, which tests can monkeypatch.
 from __future__ import annotations
 
 import json
+import re
 
 import requests
 
@@ -115,6 +116,7 @@ _QUESTION_QUERY = """
 query questionDetails($titleSlug: String!) {
   question(titleSlug: $titleSlug) {
     questionFrontendId
+    title
     difficulty
     topicTags {
       name
@@ -122,6 +124,96 @@ query questionDetails($titleSlug: String!) {
   }
 }
 """
+
+
+def slugify(name: str) -> str:
+    """Convert a topic-tag display name to its LeetCode tag slug.
+
+    Lowercase, collapse every run of non-alphanumeric characters into a
+    single hyphen, and strip leading/trailing hyphens. For example,
+    "Heap (Priority Queue)" -> "heap-priority-queue".
+    """
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+_PROBLEMS_BY_TAG_QUERY = """
+query problemsetQuestionList($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionListFilterInput) {
+  problemsetQuestionList: questionList(categorySlug: $categorySlug, limit: $limit, skip: $skip, filters: $filters) {
+    questions: data {
+      frontendQuestionId: questionFrontendId
+      title
+      titleSlug
+      difficulty
+      acRate
+      paidOnly: isPaidOnly
+      status
+    }
+  }
+}
+"""
+
+
+def fetch_problems_by_tag(tag_slug: str, limit: int = 30) -> list[dict]:
+    """Return problems tagged with ``tag_slug`` from the public problem list.
+
+    Each item is {"frontend_id": str, "title": str, "slug": str,
+    "difficulty": str, "ac_rate": float, "paid_only": bool,
+    "status": str|None}. ``status`` is None when not logged in; "ac" means
+    the problem is already solved. Raises LeetCodeError on API failures or a
+    malformed response.
+    """
+    variables = {
+        "categorySlug": "",
+        "limit": limit,
+        "skip": 0,
+        "filters": {"tags": [tag_slug]},
+    }
+    data = _graphql(_PROBLEMS_BY_TAG_QUERY, variables)
+
+    problem_list = data.get("problemsetQuestionList")
+    if problem_list is None:
+        raise LeetCodeError(
+            f"No problem list returned for tag {tag_slug!r} "
+            "(problemsetQuestionList is null). Check the tag slug."
+        )
+    if not isinstance(problem_list, dict):
+        raise LeetCodeError(
+            f"Malformed problem list for tag {tag_slug!r}: {problem_list!r}"
+        )
+
+    questions = problem_list.get("questions")
+    if questions is None:
+        raise LeetCodeError(
+            f"No questions returned for tag {tag_slug!r} (questions is null)."
+        )
+    if not isinstance(questions, list):
+        raise LeetCodeError(
+            f"Malformed questions for tag {tag_slug!r}: {questions!r}"
+        )
+
+    results: list[dict] = []
+    for item in questions:
+        if not isinstance(item, dict):
+            raise LeetCodeError(
+                f"Malformed question entry for tag {tag_slug!r}: {item!r}"
+            )
+        try:
+            ac_rate = float(item.get("acRate") or 0.0)
+        except (TypeError, ValueError):
+            ac_rate = 0.0
+        status = item.get("status")
+        results.append(
+            {
+                "frontend_id": str(item.get("frontendQuestionId", "")),
+                "title": str(item.get("title", "")),
+                "slug": str(item.get("titleSlug", "")),
+                "difficulty": str(item.get("difficulty", "")),
+                "ac_rate": ac_rate,
+                "paid_only": bool(item.get("paidOnly")),
+                "status": None if status is None else str(status),
+            }
+        )
+    return results
 
 
 def fetch_recent_ac_submissions(username: str, limit: int = 20) -> list[dict]:
@@ -179,8 +271,9 @@ def fetch_recent_ac_submissions(username: str, limit: int = 20) -> list[dict]:
 def fetch_question_details(slug: str) -> dict:
     """Return details for a question by slug.
 
-    Result is {"frontend_id": str, "difficulty": str, "tags": list[str]}.
-    Raises LeetCodeError if the question doesn't exist or the API fails.
+    Result is {"frontend_id": str, "title": str, "difficulty": str,
+    "tags": list[str]}. Raises LeetCodeError if the question doesn't exist or
+    the API fails.
     """
     data = _graphql(_QUESTION_QUERY, {"titleSlug": slug})
 
@@ -204,6 +297,63 @@ def fetch_question_details(slug: str) -> dict:
 
     return {
         "frontend_id": str(question.get("questionFrontendId", "")),
+        "title": str(question.get("title", "")),
         "difficulty": str(question.get("difficulty", "")),
         "tags": tags,
     }
+
+
+_ALL_PROBLEMS_URL = "https://leetcode.com/api/problems/all/"
+
+
+def fetch_solved_slugs(session_cookie: str) -> list[str]:
+    """Return the title-slugs of every problem the user has solved.
+
+    Uses the ``/api/problems/all/`` endpoint authenticated with the account's
+    ``LEETCODE_SESSION`` cookie, which tags each problem with the caller's
+    personal status. This is the only way to see solves older than the ~20
+    most recent that ``fetch_recent_ac_submissions`` returns.
+    """
+    cookie = (session_cookie or "").strip()
+    if not cookie:
+        raise LeetCodeError(
+            "No LEETCODE_SESSION cookie provided. Copy the LEETCODE_SESSION "
+            "cookie value from your browser (DevTools -> Application -> Cookies) "
+            "into LEETCODE_SESSION in .env to backfill your full history."
+        )
+    try:
+        resp = _get_session().get(
+            _ALL_PROBLEMS_URL,
+            cookies={"LEETCODE_SESSION": cookie},
+            timeout=_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        raise LeetCodeError(f"Request to {_ALL_PROBLEMS_URL} failed: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise LeetCodeError(
+            f"{_ALL_PROBLEMS_URL} returned HTTP {resp.status_code}. Your "
+            "LEETCODE_SESSION cookie may be missing or expired."
+        )
+    try:
+        payload = resp.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise LeetCodeError(
+            f"{_ALL_PROBLEMS_URL} returned invalid JSON: {resp.text[:200]}"
+        ) from exc
+
+    pairs = payload.get("stat_status_pairs")
+    if not isinstance(pairs, list):
+        raise LeetCodeError(
+            "Unexpected response from LeetCode: no 'stat_status_pairs'. "
+            "Check that your LEETCODE_SESSION cookie is valid."
+        )
+    slugs = [
+        p["stat"]["question__title_slug"]
+        for p in pairs
+        if isinstance(p, dict)
+        and p.get("status") == "ac"
+        and isinstance(p.get("stat"), dict)
+        and p["stat"].get("question__title_slug")
+    ]
+    return slugs

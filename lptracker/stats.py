@@ -97,6 +97,79 @@ def stats_rows(stats: dict) -> list[list[str]]:
     return rows
 
 
+def by_topic_rows(solves: list[Solve]) -> list[list[str]]:
+    """Rows for the "By Topic" tab: solved problems grouped under each tag.
+
+    Tags are ordered by how many solves they have (most first, then name).
+    A problem with several tags appears under each of them. Within a tag,
+    problems are listed by difficulty (Easy -> Medium -> Hard) then number.
+    """
+    difficulty_rank = {d: i for i, d in enumerate(DIFFICULTIES)}
+
+    by_tag: dict[str, list[Solve]] = {}
+    for solve in solves:
+        for tag in solve.tags:
+            by_tag.setdefault(tag, []).append(solve)
+
+    ordered_tags = sorted(by_tag, key=lambda tag: (-len(by_tag[tag]), tag))
+
+    def _num(solve: Solve) -> int:
+        try:
+            return int(solve.frontend_id)
+        except (TypeError, ValueError):
+            return 10**9
+
+    rows: list[list[str]] = []
+    for tag in ordered_tags:
+        problems = sorted(
+            by_tag[tag],
+            key=lambda s: (difficulty_rank.get(s.difficulty, len(DIFFICULTIES)), _num(s)),
+        )
+        rows.append([f"{tag} ({len(problems)})"])
+        for solve in problems:
+            rows.append(["", solve.frontend_id, solve.title, solve.difficulty, solve.link_cell()])
+        rows.append([])
+    return rows
+
+
+def by_date_rows(solves: list[Solve]) -> list[list[str]]:
+    """Rows for the "By Date" tab: a solve timeline, newest date first.
+
+    Problems with a valid Date Solved are grouped under a date heading
+    (most recent first). Problems without a date — e.g. backfilled history,
+    where LeetCode doesn't expose the original solve date — are collected
+    under a trailing "Undated (backfilled)" section, sorted by number.
+    """
+    dated: dict[str, list[Solve]] = {}
+    undated: list[Solve] = []
+    for solve in solves:
+        if _parse_date(solve.date_solved) is not None:
+            dated.setdefault(solve.date_solved, []).append(solve)
+        else:
+            undated.append(solve)
+
+    def _num(solve: Solve) -> int:
+        try:
+            return int(solve.frontend_id)
+        except (TypeError, ValueError):
+            return 10**9
+
+    rows: list[list[str]] = []
+    for date in sorted(dated, reverse=True):  # newest first
+        problems = sorted(dated[date], key=_num)
+        rows.append([f"{date} ({len(problems)})"])
+        for solve in problems:
+            rows.append(["", solve.frontend_id, solve.title, solve.difficulty, solve.link_cell()])
+        rows.append([])
+
+    if undated:
+        rows.append([f"Undated (backfilled) ({len(undated)})"])
+        for solve in sorted(undated, key=_num):
+            rows.append(["", solve.frontend_id, solve.title, solve.difficulty, solve.link_cell()])
+        rows.append([])
+    return rows
+
+
 def format_stats_text(stats: dict) -> str:
     """Human-readable multi-line summary for terminal output."""
     lines: list[str] = [

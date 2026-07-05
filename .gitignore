@@ -6,3 +6,8 @@ credentials.json
 *.egg-info/
 .venv/
 venv/
+
+# Personal / runtime files
+*.log
+slugs.txt
+backfill_slugs.txt

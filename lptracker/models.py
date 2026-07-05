@@ -19,6 +19,7 @@ PROGRESS_HEADERS = [
     "Time (min)",
     "Attempts",
     "Confidence (1-5)",
+    "Mastered",
     "Needs Review",
     "Next Review",
     "Notes",
@@ -37,6 +38,7 @@ class Solve:
     time_min: str = ""
     attempts: str = ""
     confidence: str = ""
+    mastered: str = ""  # "TRUE" / "FALSE" / ""
     needs_review: str = ""  # "TRUE" / "FALSE" / ""
     next_review: str = ""  # YYYY-MM-DD or ""
     notes: str = ""
@@ -44,6 +46,10 @@ class Solve:
     @property
     def link(self) -> str:
         return f"https://leetcode.com/problems/{self.slug}/" if self.slug else ""
+
+    def link_cell(self) -> str:
+        """Compact clickable link for the sheet: a HYPERLINK formula showing ↗."""
+        return f'=HYPERLINK("{self.link}","↗")' if self.slug else ""
 
     def to_row(self) -> list[str]:
         return [
@@ -54,10 +60,11 @@ class Solve:
             ", ".join(self.tags),
             self.date_solved,
             self.language,
-            self.link,
+            self.link_cell(),
             self.time_min,
             self.attempts,
             self.confidence,
+            self.mastered,
             self.needs_review,
             self.next_review,
             self.notes,
@@ -76,10 +83,12 @@ class Solve:
             tags=[t.strip() for t in str(padded[4]).split(",") if t.strip()],
             date_solved=str(padded[5]),
             language=str(padded[6]),
+            # padded[7] is the Link cell (derived from slug); not read back.
             time_min=str(padded[8]),
             attempts=str(padded[9]),
             confidence=str(padded[10]),
-            needs_review=str(padded[11]),
-            next_review=str(padded[12]),
-            notes=str(padded[13]),
+            mastered=str(padded[11]),
+            needs_review=str(padded[12]),
+            next_review=str(padded[13]),
+            notes=str(padded[14]),
         )

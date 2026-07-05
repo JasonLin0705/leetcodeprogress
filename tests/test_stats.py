@@ -3,7 +3,13 @@
 import datetime
 
 from lptracker.models import Solve
-from lptracker.stats import compute_stats, format_stats_text, stats_rows
+from lptracker.stats import (
+    by_date_rows,
+    by_topic_rows,
+    compute_stats,
+    format_stats_text,
+    stats_rows,
+)
 
 TODAY = datetime.date(2026, 7, 1)  # a fixed Wednesday; week Monday is 2026-06-29
 
@@ -159,6 +165,44 @@ def test_stats_rows_structure():
     assert week_rows[-1] == ["2026-06-29", "2"]
     assert rows[19] == []
     assert rows[20] == ["Current Streak (days)", "2"]
+
+
+def test_by_topic_rows_groups_and_orders():
+    solves = [
+        make_solve(frontend_id="1", title="Two Sum", slug="two-sum", difficulty="Easy", tags=["Array", "Hash Table"]),
+        make_solve(frontend_id="15", title="3Sum", slug="3sum", difficulty="Medium", tags=["Array"]),
+        make_solve(frontend_id="242", title="Valid Anagram", slug="valid-anagram", difficulty="Easy", tags=["Hash Table"]),
+    ]
+    rows = by_topic_rows(solves)
+    # Array has 2 solves, Hash Table has 2 -> tie broken by name; both header rows present.
+    headers = [r[0] for r in rows if len(r) == 1]
+    assert "Array (2)" in headers
+    assert "Hash Table (2)" in headers
+    # Array group: Easy (Two Sum) before Medium (3Sum).
+    array_start = rows.index(["Array (2)"])
+    assert rows[array_start + 1][2] == "Two Sum"
+    assert rows[array_start + 2][2] == "3Sum"
+    # Problem rows carry a HYPERLINK link cell in the last column.
+    assert rows[array_start + 1][4].startswith('=HYPERLINK(')
+
+
+def test_by_date_rows_newest_first_with_undated_section():
+    solves = [
+        make_solve(frontend_id="1", title="Two Sum", slug="two-sum", difficulty="Easy", date_solved="2026-07-01"),
+        make_solve(frontend_id="55", title="Jump Game", slug="jump-game", difficulty="Medium", date_solved="2026-07-03"),
+        make_solve(frontend_id="9", title="Palindrome Number", slug="palindrome-number", difficulty="Easy", date_solved=""),
+    ]
+    rows = by_date_rows(solves)
+    headers = [r[0] for r in rows if len(r) == 1]
+    # Newest date heading comes before the older one.
+    assert headers.index("2026-07-03 (1)") < headers.index("2026-07-01 (1)")
+    # Undated (backfilled) problems are grouped in a trailing section.
+    assert "Undated (backfilled) (1)" in headers
+    assert headers[-1] == "Undated (backfilled) (1)"
+    # A dated problem row carries the link cell.
+    jump_idx = rows.index(["2026-07-03 (1)"])
+    assert rows[jump_idx + 1][2] == "Jump Game"
+    assert rows[jump_idx + 1][4].startswith("=HYPERLINK(")
 
 
 def test_format_stats_text_contains_all_sections():

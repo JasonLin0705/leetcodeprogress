@@ -10,10 +10,25 @@ import sys
 
 from dotenv import load_dotenv
 
+from . import google, suggest
 from .models import Solve
 from .review import needs_review, next_review_date
-from .sheets import DryRunSheetClient, SheetClient, SheetError
-from .stats import compute_stats, format_stats_text, stats_rows
+from .sheets import (
+    DATE_TAB,
+    GOOGLE_TAB,
+    SUGGESTIONS_TAB,
+    TOPIC_TAB,
+    DryRunSheetClient,
+    SheetClient,
+    SheetError,
+)
+from .stats import (
+    by_date_rows,
+    by_topic_rows,
+    compute_stats,
+    format_stats_text,
+    stats_rows,
+)
 
 DEFAULT_SYNC_LIMIT = 20
 
@@ -97,13 +112,116 @@ def cmd_sync(args: argparse.Namespace) -> int:
     if new_solves:
         client.append_solves(new_solves)
 
-    stats = compute_stats(existing + new_solves)
-    client.write_stats(stats_rows(stats))
+    all_solves = existing + new_solves
+    stats = compute_stats(all_solves)
+    _write_derived(client, stats, all_solves)
 
     print(
         f"Fetched {len(submissions)} recent accepted submission(s); "
-        f"{len(new_solves)} new. Appended {len(new_solves)} row(s); stats updated."
+        f"{len(new_solves)} new. Appended {len(new_solves)} row(s); "
+        "stats, By Topic and Suggestions updated."
     )
+    return 0
+
+
+def _write_derived(client, stats: dict, all_solves: list[Solve]) -> None:
+    """Write Stats, re-sort Progress, and rebuild every derived tab."""
+    solved_slugs = {solve.slug for solve in all_solves}
+    client.write_stats(stats_rows(stats))
+    client.sort_progress()
+    client.write_tab(TOPIC_TAB, by_topic_rows(all_solves))
+    client.write_tab(DATE_TAB, by_date_rows(all_solves))
+    client.write_tab(GOOGLE_TAB, google.google_prep_rows(solved_slugs))
+    _refresh_suggestions(client, stats, all_solves)
+
+
+def _refresh_suggestions(client, stats: dict, all_solves: list[Solve]) -> None:
+    """Rebuild the Suggestions tab; never let a fetch failure break the caller."""
+    solved_slugs = {solve.slug for solve in all_solves}
+    weak = suggest.weakest_tags(stats)
+    try:
+        rows = suggest.build_suggestions(weak, solved_slugs)
+    except Exception as exc:  # network/API hiccup shouldn't abort a sync
+        print(f"warning: could not refresh suggestions: {exc}", file=sys.stderr)
+        return
+    client.write_tab(SUGGESTIONS_TAB, rows)
+
+
+def _backfill_slugs(args: argparse.Namespace, leetcode) -> list[str]:
+    """Resolve the list of solved slugs from --file or the LEETCODE_SESSION cookie."""
+    if args.file:
+        try:
+            with open(args.file, encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError as exc:
+            raise CliError(f"Could not read --file {args.file!r}: {exc}")
+        return [s.strip() for s in text.replace(",", "\n").split() if s.strip()]
+
+    cookie = os.environ.get("LEETCODE_SESSION", "").strip()
+    if cookie:
+        return leetcode.fetch_solved_slugs(cookie)
+
+    raise CliError(
+        "Nothing to backfill from. Pass --file <slugs.txt>, or set "
+        "LEETCODE_SESSION in .env to pull your full solved history (see README)."
+    )
+
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    leetcode = _leetcode()
+    slugs = _backfill_slugs(args, leetcode)
+
+    client = _make_client(args)
+    existing = client.get_solves()
+    existing_slugs = {solve.slug for solve in existing}
+
+    todo: list[str] = []
+    seen: set[str] = set()
+    for slug in slugs:
+        if slug in existing_slugs or slug in seen:
+            continue
+        seen.add(slug)
+        todo.append(slug)
+    if args.limit is not None:
+        todo = todo[: args.limit]
+
+    print(
+        f"{len(slugs)} solved found; {len(existing_slugs)} already tracked; "
+        f"backfilling {len(todo)}."
+    )
+
+    new_solves: list[Solve] = []
+    for i, slug in enumerate(todo, 1):
+        try:
+            details = leetcode.fetch_question_details(slug)
+        except Exception as exc:  # one bad slug shouldn't abort the whole run
+            print(f"  skip {slug}: {exc}", file=sys.stderr)
+            continue
+        new_solves.append(
+            Solve(
+                frontend_id=str(details["frontend_id"]),
+                title=details.get("title") or slug,
+                slug=slug,
+                difficulty=details["difficulty"],
+                tags=list(details["tags"]),
+                date_solved="",  # historical solve date isn't available
+                language="",
+            )
+        )
+        if i % 25 == 0:
+            print(f"  fetched {i}/{len(todo)} ...")
+
+    if new_solves:
+        client.append_solves(new_solves)
+
+    all_solves = existing + new_solves
+    _write_derived(client, compute_stats(all_solves), all_solves)
+
+    if not args.dry_run:
+        print(
+            f"Backfilled {len(new_solves)} problem(s); the sheet now tracks "
+            f"{len(all_solves)}. (Historical solves have a blank Date Solved.)"
+        )
     return 0
 
 
@@ -120,19 +238,20 @@ def cmd_annotate(args: argparse.Namespace) -> int:
         )
 
     client = _make_client(args)
-    solves = client.get_solves()
+    rows = client.get_rows()
 
     key = args.problem
-    index = next(
-        (i for i, s in enumerate(solves) if key in (s.slug, s.frontend_id)), None
+    match = next(
+        ((row_number, s) for row_number, s in rows if key in (s.slug, s.frontend_id)),
+        None,
     )
-    if index is None:
+    if match is None:
         message = f"No row found for {key!r} (matched against slug and #)."
         if args.dry_run:
             message += " Note: --dry-run reads no sheet data, so lookups always miss."
         raise CliError(message)
 
-    solve = solves[index]
+    row_number, solve = match
     if args.time is not None:
         solve.time_min = str(args.time)
     if args.attempts is not None:
@@ -143,8 +262,9 @@ def cmd_annotate(args: argparse.Namespace) -> int:
         solve.confidence = str(args.confidence)
         solve.needs_review = needs_review(args.confidence)
         solve.next_review = next_review_date(args.confidence)
+        if args.confidence == 5:
+            solve.mastered = "TRUE"  # top confidence auto-ticks Mastered
 
-    row_number = index + 2  # header is sheet row 1, first data row is 2
     client.update_solve(row_number, solve)
     if not args.dry_run:
         print(f"Updated row {row_number} ({solve.slug}).")
@@ -155,6 +275,39 @@ def cmd_stats(args: argparse.Namespace) -> int:
     client = _make_client(args)
     solves = client.get_solves()
     print(format_stats_text(compute_stats(solves)))
+    return 0
+
+
+def cmd_suggest(args: argparse.Namespace) -> int:
+    client = _make_client(args)
+    solves = client.get_solves()
+    stats = compute_stats(solves)
+    solved_slugs = {solve.slug for solve in solves}
+    weak = suggest.weakest_tags(stats, k=args.count)
+    rows = suggest.build_suggestions(weak, solved_slugs, per_tag=args.per_tag)
+    client.write_tab(SUGGESTIONS_TAB, rows)
+    if not args.dry_run:
+        scope = f"{len(weak)} topic(s), weakest first" if weak else "no topics solved yet"
+        print(f"Suggestions updated ({scope}).")
+    return 0
+
+
+def cmd_review(args: argparse.Namespace) -> int:
+    client = _make_client(args)
+    solves = client.get_solves()
+    today = datetime.date.today().isoformat()
+    due = [
+        s
+        for s in solves
+        if s.needs_review == "TRUE" and s.next_review and s.next_review <= today
+    ]
+    due.sort(key=lambda s: s.next_review)
+    if not due:
+        print("Nothing is due for review right now. ")
+        return 0
+    print(f"{len(due)} problem(s) due for review (as of {today}):")
+    for s in due:
+        print(f"  {s.next_review}  #{s.frontend_id}  {s.title}  ({s.difficulty})  {s.link}")
     return 0
 
 
@@ -219,6 +372,47 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_stats = sub.add_parser("stats", help="Print a progress summary (read-only).")
     p_stats.set_defaults(func=cmd_stats)
+
+    p_suggest = sub.add_parser(
+        "suggest",
+        help="Rebuild the Suggestions tab with problems in your weakest topics.",
+    )
+    p_suggest.add_argument(
+        "--count", type=int, default=None, metavar="N",
+        help="How many of your weakest topics to cover (default: every topic).",
+    )
+    p_suggest.add_argument(
+        "--per-tag", type=int, default=3, metavar="N",
+        help="How many problems to suggest per topic (default 3).",
+    )
+    p_suggest.add_argument(
+        "--dry-run", action="store_true", help="Print actions instead of writing."
+    )
+    p_suggest.set_defaults(func=cmd_suggest)
+
+    p_review = sub.add_parser(
+        "review", help="List problems due for review today (read-only)."
+    )
+    p_review.set_defaults(func=cmd_review)
+
+    p_backfill = sub.add_parser(
+        "backfill",
+        help="Import your full solved history (beyond the recent-submissions window).",
+    )
+    p_backfill.add_argument(
+        "--file",
+        metavar="PATH",
+        help="File of solved slugs (newline- or comma-separated). "
+        "If omitted, uses the LEETCODE_SESSION cookie to fetch them.",
+    )
+    p_backfill.add_argument(
+        "--limit", type=int, default=None, metavar="N",
+        help="Only backfill the first N missing problems (useful for a trial run).",
+    )
+    p_backfill.add_argument(
+        "--dry-run", action="store_true", help="Print actions instead of writing."
+    )
+    p_backfill.set_defaults(func=cmd_backfill)
 
     return parser
 

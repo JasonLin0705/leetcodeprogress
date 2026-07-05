@@ -11,7 +11,7 @@ import pytest
 from lptracker import cli
 from lptracker.models import PROGRESS_HEADERS, Solve
 from lptracker.review import needs_review, next_review_date
-from lptracker.sheets import DryRunSheetClient, PROGRESS_TAB, STATS_TAB
+from lptracker.sheets import DryRunSheetClient, PROGRESS_TAB, STATS_TAB, TOPIC_TAB
 
 
 # -- test doubles -------------------------------------------------------------
@@ -26,9 +26,15 @@ class FakeSheetClient:
         self.updated = []  # (row_number, solve) pairs
         self.stats_rows = None
         self.init_called = False
+        self.sorted = False
+        self.tabs = {}  # tab name -> rows written via write_tab
 
     def init_sheet(self):
         self.init_called = True
+
+    def get_rows(self):
+        # Header is sheet row 1, so the first data row is 2.
+        return [(i + 2, solve) for i, solve in enumerate(self.solves)]
 
     def get_solves(self):
         return list(self.solves)
@@ -36,11 +42,17 @@ class FakeSheetClient:
     def append_solves(self, solves):
         self.appended.extend(solves)
 
+    def sort_progress(self):
+        self.sorted = True
+
     def update_solve(self, row_number, solve):
         self.updated.append((row_number, solve))
 
     def write_stats(self, rows):
         self.stats_rows = rows
+
+    def write_tab(self, name, rows, header=True):
+        self.tabs[name] = rows
 
 
 def install_fake_leetcode(monkeypatch, submissions=None, details=None):
@@ -66,10 +78,27 @@ def install_fake_leetcode(monkeypatch, submissions=None, details=None):
             raise AssertionError(f"unexpected fetch_question_details({slug!r})")
         return details[slug]
 
+    def fetch_problems_by_tag(tag_slug, limit=30):
+        return []
+
+    def slugify(name):
+        import re
+
+        return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
     fake.fetch_recent_ac_submissions = fetch_recent_ac_submissions
     fake.fetch_question_details = fetch_question_details
+    fake.fetch_problems_by_tag = fetch_problems_by_tag
+    fake.slugify = slugify
     monkeypatch.setitem(sys.modules, "lptracker.leetcode", fake)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def _no_dotenv(monkeypatch):
+    # Keep tests isolated from a developer's real .env file, which main()
+    # would otherwise load and use to fill env vars the tests deliberately unset.
+    monkeypatch.setattr(cli, "load_dotenv", lambda *args, **kwargs: None)
 
 
 @pytest.fixture
@@ -164,7 +193,9 @@ class TestSync:
         expected_date = datetime.date.fromtimestamp(t_old).isoformat()
         assert row[idx("Date Solved")] == expected_date
         assert row[idx("Language")] == "cpp"
-        assert row[idx("Link")] == "https://leetcode.com/problems/valid-anagram/"
+        assert row[idx("Link")] == (
+            '=HYPERLINK("https://leetcode.com/problems/valid-anagram/","↗")'
+        )
         # Manual fields left blank.
         for col in ("Time (min)", "Attempts", "Confidence (1-5)", "Notes"):
             assert row[idx(col)] == ""
@@ -282,6 +313,51 @@ class TestAnnotate:
         err = capsys.readouterr().err
         assert "No row found" in err
         assert "dry-run" in err
+
+
+# -- backfill ------------------------------------------------------------------
+
+
+class TestBackfill:
+    def test_backfill_from_file_appends_only_missing(
+        self, monkeypatch, env, tmp_path, capsys
+    ):
+        existing = [Solve(frontend_id="1", title="Two Sum", slug="two-sum")]
+        install_fake_leetcode(
+            monkeypatch,
+            details={
+                "valid-anagram": {
+                    "frontend_id": "242",
+                    "title": "Valid Anagram",
+                    "difficulty": "Easy",
+                    "tags": ["Hash Table", "String"],
+                }
+            },
+        )
+        client = use_fake_client(monkeypatch, FakeSheetClient(existing))
+        slugs_file = tmp_path / "slugs.txt"
+        slugs_file.write_text("two-sum, valid-anagram\n")
+
+        assert cli.main(["backfill", "--file", str(slugs_file)]) == 0
+
+        # two-sum is already tracked; only valid-anagram is fetched + appended.
+        assert len(client.appended) == 1
+        added = client.appended[0]
+        assert added.slug == "valid-anagram"
+        assert added.title == "Valid Anagram"
+        assert added.tags == ["Hash Table", "String"]
+        assert added.date_solved == ""  # historical solves have no known date
+        # Derived tabs are refreshed.
+        assert client.sorted is True
+        assert TOPIC_TAB in client.tabs
+
+    def test_backfill_requires_a_source(self, monkeypatch, env, capsys):
+        install_fake_leetcode(monkeypatch)
+        use_fake_client(monkeypatch, FakeSheetClient())
+        monkeypatch.delenv("LEETCODE_SESSION", raising=False)
+
+        assert cli.main(["backfill"]) == 1
+        assert "Nothing to backfill" in capsys.readouterr().err
 
 
 # -- stats / init ---------------------------------------------------------------
